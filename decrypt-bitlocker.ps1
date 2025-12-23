@@ -22,6 +22,30 @@ Write-Host @"
 function Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
 function Warn($m){ Write-Host "[!]" $m -ForegroundColor Yellow }
 function Err ($m){ Write-Host "[X]" $m -ForegroundColor Red }
+
+function Show-Tree {
+    param(
+        [string]$Path,
+        [int]$Depth = 3,
+        [int]$Level = 0
+    )
+
+    if ($Level -ge $Depth) { return }
+
+    try {
+        $items = Get-ChildItem $Path -Force -ErrorAction Stop
+    } catch {
+        throw "Access denied or unreadable"
+    }
+
+    foreach ($i in $items) {
+        $indent = ("│   " * $Level)
+        Write-Host "$indent├── $($i.Name)"
+        if ($i.PSIsContainer) {
+            Show-Tree -Path $i.FullName -Depth $Depth -Level ($Level + 1)
+        }
+    }
+}
 #endregion
 
 #region ENUMERATION
@@ -35,50 +59,64 @@ $ID = 1
 
 foreach ($v in $Volumes) {
 
-    $Encrypted = "NO"
-    $EncType   = "CLEAR"
-    $Priority  = "LOW"
+    # Defaults
+    $Encrypted   = "NO"
+    $EncType     = "CLEAR"
+    $AccessClass = "CLEAR"
+    $LiveUnlock  = "NO"
+    $MemAcquire  = "NO"
+    $Priority    = "LOW"
 
-    # --- BitLocker (verificación real)
+    # --- BitLocker ---
     if ($BitLockerAvailable -and $v.DriveLetter) {
         try {
             $bl = Get-BitLockerVolume -MountPoint $v.DriveLetter -ErrorAction Stop
             if ($bl.VolumeStatus -ne "FullyDecrypted") {
-                $Encrypted = "YES"
-                $EncType   = "BITLOCKER ($($bl.EncryptionMethod))"
-                $Priority  = "HIGH"
+                $Encrypted   = "YES"
+                $EncType     = "BITLOCKER ($($bl.EncryptionMethod))"
+                $AccessClass = "ENCRYPTED_UNCOVERED"
+                $LiveUnlock  = "YES"
+                $MemAcquire  = "YES"
+                $Priority    = "HIGH"
             }
         } catch {}
     }
 
-    # --- Full Disk Encryption third-party (estricto)
+    # --- Strong third-party / RAW ---
     if (
         ($v.FileSystem -eq $null -or $v.FileSystem -eq "RAW") -and
         ($v.Capacity -gt 1GB)
     ) {
-        $Encrypted = "YES"
-        $EncType   = "THIRD-PARTY FULL DISK"
-        $Priority  = "CRITICAL"
+        $Encrypted   = "YES"
+        $EncType     = "THIRD-PARTY FULL DISK"
+        $AccessClass = "ENCRYPTED_LOCKED"
+        $LiveUnlock  = "NO"
+        $MemAcquire  = "YES"
+        $Priority    = "CRITICAL"
     }
 
     $Table += [pscustomobject]@{
-        ID        = $ID
-        Drive     = if ($v.DriveLetter) { $v.DriveLetter } else { "[NO LETTER]" }
-        FS        = if ($v.FileSystem) { $v.FileSystem } else { "RAW" }
-        SizeGB    = [math]::Round($v.Capacity / 1GB,2)
-        Encrypted = $Encrypted
-        Type      = $EncType
-        Priority  = $Priority
-        Root      = if ($v.DriveLetter) { $v.DriveLetter + "\" } else { $null }
+        ID         = $ID
+        Drive      = if ($v.DriveLetter) { $v.DriveLetter } else { "[NO LETTER]" }
+        FS         = if ($v.FileSystem) { $v.FileSystem } else { "RAW" }
+        SizeGB     = [math]::Round($v.Capacity / 1GB,2)
+        Encrypted  = $Encrypted
+        Type       = $EncType
+        Access     = $AccessClass
+        LiveUnlock = $LiveUnlock
+        MemAcquire = $MemAcquire
+        Priority   = $Priority
+        Root       = if ($v.DriveLetter) { $v.DriveLetter + "\" } else { $null }
     }
+
     $ID++
 }
 #endregion
 
-#region DISPLAY (COLORIZED)
+#region DISPLAY
 Write-Host ""
-Write-Host "ID Drive        FS     SizeGB  Encrypted  Type                          Priority"
-Write-Host "-- -----        --     ------  ---------  ----                          --------"
+Write-Host "ID Drive        FS     SizeGB  Encrypted  Type                        Access                 Live  RAM   Priority"
+Write-Host "-- -----        --     ------  ---------  ----                        ------                 ----  ----  --------"
 
 foreach ($row in $Table) {
 
@@ -89,49 +127,56 @@ foreach ($row in $Table) {
         default    { $Color = "White" }
     }
 
-    $line = "{0,-2} {1,-12} {2,-6} {3,-7} {4,-9} {5,-28} {6}" -f `
+    $line = "{0,-2} {1,-12} {2,-6} {3,-7} {4,-9} {5,-26} {6,-21} {7,-5} {8,-5} {9}" -f `
         $row.ID,
         $row.Drive,
         $row.FS,
         $row.SizeGB,
         $row.Encrypted,
         $row.Type,
+        $row.Access,
+        $row.LiveUnlock,
+        $row.MemAcquire,
         $row.Priority
 
     Write-Host $line -ForegroundColor $Color
 }
 #endregion
 
-#region REPORT
-Info "Generating forensic report..."
+#region SELECT VOLUME
+$Choice = Read-Host "`nSelect volume ID to display tree (ENTER to exit)"
+if (-not $Choice) { return }
 
-foreach ($v in $Table | Where-Object { $_.Root }) {
+$Selected = $Table | Where-Object { $_.ID -eq [int]$Choice }
 
-    Write-Host "`n--- Volume $($v.Drive) ---" -ForegroundColor Cyan
+if (-not $Selected) {
+    Err "Invalid ID"
+    return
+}
 
-    # Timeline del volumen
-    try {
-        $rootItem = Get-Item $v.Root -ErrorAction Stop
-        $rootItem | Select-Object CreationTime, LastWriteTime, LastAccessTime | Format-List
-    } catch {
-        Warn "Timeline not accessible"
-    }
-
-    # Hash lógico del volumen (estructura accesible)
-    try {
-        $files = Get-ChildItem $v.Root -Recurse -File -ErrorAction SilentlyContinue
-        if ($files) {
-            $hash = ($files | Get-FileHash -Algorithm SHA256).Hash |
-                Sort-Object |
-                Get-FileHash -Algorithm SHA256
-            Write-Host "Logical Volume SHA256: $($hash.Hash)" -ForegroundColor Gray
-        } else {
-            Warn "No accessible files for hashing"
-        }
-    } catch {
-        Warn "Hashing failed"
-    }
+if (-not $Selected.Root) {
+    Err "Volume has no mount point (locked or encrypted)"
+    return
 }
 #endregion
 
-Write-Host "`nTriage completed. Report mode only." -ForegroundColor DarkGray
+#region TREE VIEW
+Info "Building directory tree for $($Selected.Drive)"
+
+try {
+    $files = Get-ChildItem $Selected.Root -Force -ErrorAction Stop
+    if (-not $files) {
+        Warn "Volume accessible but contains no files"
+        return
+    }
+
+    Write-Host "`nTREE (depth = 3):" -ForegroundColor Cyan
+    Write-Host $Selected.Root
+    Show-Tree -Path $Selected.Root -Depth 3
+
+} catch {
+    Err "Unable to enumerate files (encrypted, permission denied or locked)"
+}
+#endregion
+
+Write-Host "`nTriage completed (report-only mode)." -ForegroundColor DarkGray
