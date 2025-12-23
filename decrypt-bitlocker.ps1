@@ -43,41 +43,57 @@ function SafeExec($Name,[scriptblock]$b){
 #endregion
 
 #region PARTITION ENUMERATION (MAGNET-LIKE)
-SafeExec "Enumerating disks and partitions" {
+Status "Enumerating disks and partitions"
 
-    $volumes = Get-CimInstance Win32_LogicalDisk
-    $bitlockerAvailable = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
+$volumes = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue
+$bitlockerCmd = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
 
-    foreach ($v in $volumes) {
+foreach ($v in $volumes) {
 
-        $encStatus = "Unknown"
+    try {
+        $encStatus = "N/A"
         $encMethod = "N/A"
 
-        if ($bitlockerAvailable -and $v.DriveType -eq 3) {
-            $bl = Get-BitLockerVolume -MountPoint $v.DeviceID -ErrorAction SilentlyContinue
-            if ($bl) {
-                $encStatus = $bl.ProtectionStatus
-                $encMethod = $bl.EncryptionMethod
+        if ($bitlockerCmd -and $v.DriveType -eq 3) {
+            try {
+                $bl = Get-BitLockerVolume -MountPoint $v.DeviceID -ErrorAction Stop
+                if ($bl) {
+                    $encStatus = switch ($bl.ProtectionStatus) {
+                        0 { "Off" }
+                        1 { "On" }
+                        default { "Unknown" }
+                    }
+                    $encMethod = $bl.EncryptionMethod
+                }
+            } catch {
+                $encStatus = "Unavailable"
             }
         }
 
         $Results += [pscustomobject]@{
-            Drive        = $v.DeviceID
-            VolumeName   = $v.VolumeName
-            FileSystem   = $v.FileSystem
-            DriveType    = switch ($v.DriveType) {
+            Drive      = $v.DeviceID
+            Label      = $v.VolumeName
+            FileSystem = $v.FileSystem
+            Type       = switch ($v.DriveType) {
                 2 { "Removable (USB)" }
                 3 { "Fixed Disk" }
                 5 { "Optical" }
                 default { "Other" }
             }
-            SizeGB       = [math]::Round($v.Size / 1GB,2)
-            FreeGB       = [math]::Round($v.FreeSpace / 1GB,2)
-            Encryption   = $encStatus
-            Cipher       = $encMethod
+            SizeGB     = if ($v.Size) { [math]::Round($v.Size / 1GB,2) } else { "N/A" }
+            FreeGB     = if ($v.FreeSpace) { [math]::Round($v.FreeSpace / 1GB,2) } else { "N/A" }
+            Encryption = $encStatus
+            Cipher     = $encMethod
+        }
+
+    } catch {
+        $Errors += [pscustomobject]@{
+            Drive = $v.DeviceID
+            Error = $_.Exception.Message
         }
     }
 }
+
 #endregion
 
 #region OUTPUT
