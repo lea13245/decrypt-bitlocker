@@ -1,180 +1,91 @@
-#Requires -RunAsAdministrator
-Set-StrictMode -Off
-$ErrorActionPreference = "Stop"
+#region UI / BANNER
+cls
+cls
 
-# =======================
-# CONFIGURACIÓN
-# =======================
-$CASE_ID = "CASE_001"
-$DFIR_HOSTNAME = $env:COMPUTERNAME
-$ROOT = Join-Path $env:SystemDrive "DFIR_EDD_$CASE_ID"
-$COPY_DIR = Join-Path $ROOT "COPIED"
-$ERR_FILE = Join-Path $ROOT "ERRORS.txt"
-$OUT_FILE = Join-Path $ROOT "EDD.txt"
+Write-Host @"
+  _________                                         .__                           
+ /   _____/ ___________   ____   ____   ____   _____|  |__ _____ _______   ____   
+ \_____  \_/ ___\_  __ \_/ __ \_/ __ \ /    \ /  ___/  |  \\__  \\_  __ \_/ __ \  
+ /        \  \___|  | \/\  ___/\  ___/|   |  \\___ \|   Y  \/ __ \|  | \/\  ___/  
+/_______  /\___  >__|    \___  >\___  >___|  /____  >___|  (____  /__|    \___  > 
+        \/     \/            \/     \/     \/     \/     \/     \/            \/  
+   _____  .__  .__  .__                            
+  /  _  \ |  | |  | |__|____    ____   ____  ____  
+ /  /_\  \|  | |  | |  \__  \  /    \_/ ___\/ __ \ 
+/    |    \  |_|  |_|  |/ __ \|   |  \  \__\  ___/ 
+\____|__  /____/____/__(____  /___|  /\___  >___  >
+        \/                  \/     \/     \/    \/ 
+"@ -ForegroundColor White
 
-New-Item -ItemType Directory -Force -Path $ROOT,$COPY_DIR | Out-Null
+Start-Sleep 1
+cls
+#endregion
 
-$UTC = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+#region CORE
+$Results = @()
+$Errors  = @()
 
-# =======================
-# FIRMAS DE CIFRADO
-# =======================
-$CRYPTO_SIGS = @(
-  "bitlocker","fvevol",
-  "veracrypt","truecrypt",
-  "pgpwded","pgp",
-  "safeboot","mcafee",
-  "checkpoint","fde",
-  "bestcrypt",
-  "symantec",
-  "luks"
-)
+function Status($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
 
-# =======================
-# HELPERS
-# =======================
-function Log { param([string]$Msg)
-  Add-Content -Encoding UTF8 -Path $OUT_FILE -Value $Msg
-}
-function LogErr { param([string]$Block,[string]$Err)
-  Add-Content -Encoding UTF8 -Path $ERR_FILE -Value ("[{0}] {1}" -f $Block,$Err)
-}
-function SafeExec {
-  param([string]$Name,[scriptblock]$Code)
-  try { & $Code }
-  catch {
-    LogErr $Name $_.Exception.Message
-    try { & $Code }
-    catch { LogErr "$Name-RETRY" $_.Exception.Message }
-  }
-}
-
-# =======================
-# HEADER (ESTILO MAGNET)
-# =======================
-Log "MAGNET-STYLE ENCRYPTED DISK DETECTOR +"
-Log "Host: $DFIR_HOSTNAME"
-Log "Case: $CASE_ID"
-Log "Time: $UTC"
-Log "-------------------------------------"
-
-# =======================
-# PHYSICAL DISKS
-# =======================
-SafeExec "DISKS" {
-  Log "== PHYSICAL DISKS =="
-  Get-Disk | ForEach-Object {
-    Log ("Disk {0}: {1} | Bus:{2} | Partition:{3}" -f `
-      $_.Number,$_.FriendlyName,$_.BusType,$_.PartitionStyle)
-  }
-}
-
-# =======================
-# LOGICAL VOLUMES
-# =======================
-SafeExec "VOLUMES" {
-  Log "== LOGICAL VOLUMES =="
-  Get-Volume | ForEach-Object {
-    Log ("Volume {0}: FS:{1} Label:{2} Health:{3}" -f `
-      ($_.DriveLetter -as [string]),$_.FileSystem,$_.FileSystemLabel,$_.HealthStatus)
-  }
-}
-
-# =======================
-# BITLOCKER
-# =======================
-SafeExec "BITLOCKER" {
-  Log "== BITLOCKER STATUS =="
-  if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-    Get-BitLockerVolume | ForEach-Object {
-      Log ("{0} | Status:{1} | Lock:{2}" -f `
-        $_.MountPoint,$_.VolumeStatus,$_.LockStatus)
+function SafeExec($Name,[scriptblock]$b){
+    try {
+        Status $Name
+        & $b
+    } catch {
+        $Errors += [pscustomobject]@{
+            Step  = $Name
+            Error = $_.Exception.Message
+        }
+        Err "$Name failed"
     }
-  } else {
-    Log "BitLocker cmdlets not available."
-  }
 }
+#endregion
 
-# =======================
-# ENCRYPTION DRIVERS
-# =======================
-SafeExec "DRIVERS" {
-  Log "== ENCRYPTION DRIVERS =="
-  Get-CimInstance Win32_SystemDriver | Where-Object {
-    $n=$_.Name.ToLower()
-    $CRYPTO_SIGS | Where-Object { $n -like "*$_*" }
-  } | ForEach-Object {
-    Log ("Driver {0} | State:{1} | Path:{2}" -f `
-      $_.Name,$_.State,$_.PathName)
-  }
-}
+#region PARTITION ENUMERATION (MAGNET-LIKE)
+SafeExec "Enumerating disks and partitions" {
 
-# =======================
-# ENCRYPTION SERVICES
-# =======================
-SafeExec "SERVICES" {
-  Log "== ENCRYPTION SERVICES =="
-  Get-Service | Where-Object {
-    $n=$_.Name.ToLower()
-    $CRYPTO_SIGS | Where-Object { $n -like "*$_*" }
-  } | ForEach-Object {
-    Log ("Service {0} | Status:{1}" -f $_.Name,$_.Status)
-  }
-}
+    $volumes = Get-CimInstance Win32_LogicalDisk
+    $bitlockerAvailable = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
 
-# =======================
-# USB PRESENT & HISTORY
-# =======================
-SafeExec "USB_PRESENT" {
-  Log "== USB PRESENT =="
-  if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
-    Get-PnpDevice -PresentOnly | Where-Object {
-      $_.Class -match "USB|Disk"
-    } | ForEach-Object {
-      Log ("USB {0} | Status:{1}" -f $_.FriendlyName,$_.Status)
+    foreach ($v in $volumes) {
+
+        $encStatus = "Unknown"
+        $encMethod = "N/A"
+
+        if ($bitlockerAvailable -and $v.DriveType -eq 3) {
+            $bl = Get-BitLockerVolume -MountPoint $v.DeviceID -ErrorAction SilentlyContinue
+            if ($bl) {
+                $encStatus = $bl.ProtectionStatus
+                $encMethod = $bl.EncryptionMethod
+            }
+        }
+
+        $Results += [pscustomobject]@{
+            Drive        = $v.DeviceID
+            VolumeName   = $v.VolumeName
+            FileSystem   = $v.FileSystem
+            DriveType    = switch ($v.DriveType) {
+                2 { "Removable (USB)" }
+                3 { "Fixed Disk" }
+                5 { "Optical" }
+                default { "Other" }
+            }
+            SizeGB       = [math]::Round($v.Size / 1GB,2)
+            FreeGB       = [math]::Round($v.FreeSpace / 1GB,2)
+            Encryption   = $encStatus
+            Cipher       = $encMethod
+        }
     }
-  } else {
-    Log "PnP cmdlets not available."
-  }
+}
+#endregion
+
+#region OUTPUT
+if ($Results.Count -gt 0) {
+    $Results | Out-GridView -Title "EDD+ Partition & Encryption Overview"
 }
 
-SafeExec "USB_HISTORY" {
-  Log "== USB HISTORY =="
-  Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*" -ErrorAction Stop |
-    ForEach-Object { Log ("USB HIST {0}" -f $_.PSChildName) }
+if ($Errors.Count -gt 0) {
+    $Errors | Out-GridView -Title "EDD+ Errors"
 }
-
-# =======================
-# DECISIÓN FORENSE
-# =======================
-SafeExec "DECISION" {
-  Log "== FORENSIC DECISION =="
-  if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-    $enc = (Get-BitLockerVolume | Where-Object {
-      $_.VolumeStatus -ne "FullyDecrypted"
-    }).Count
-    if ($enc -gt 0) { Log "ENCRYPTION DETECTED – KEEP SYSTEM POWERED ON" }
-    else { Log "NO FULL DISK ENCRYPTION DETECTED" }
-  } else {
-    Log "Decision limited: BitLocker cmdlets unavailable."
-  }
-}
-
-# =======================
-# FILE COPY (VOLUMEN YA ACCESIBLE)
-# =======================
-function Copy-AccessibleFile {
-  param([Parameter(Mandatory=$true)][string]$Path)
-  SafeExec "COPY:$Path" {
-    if (Test-Path $Path) {
-      $dst = Join-Path $COPY_DIR (Split-Path $Path -Leaf)
-      Copy-Item -Path $Path -Destination $dst -Force
-      Log ("COPIED: {0} -> {1}" -f $Path,$dst)
-    } else {
-      Log ("COPY SKIPPED (NOT FOUND): {0}" -f $Path)
-    }
-  }
-}
-
-Log "-------------------------------------"
-Log "EDD+ EXECUTION COMPLETE"
+#endregion
