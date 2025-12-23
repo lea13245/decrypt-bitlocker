@@ -1,128 +1,173 @@
-# BitLocker / USB Auto Handler (DFIR Safe)
-function Is-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p  = New-Object Security.Principal.WindowsPrincipal($id)
-    $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+#Requires -RunAsAdministrator
+Set-StrictMode -Off
+$ErrorActionPreference = "Stop"
+
+# =======================
+# CONFIGURACIÓN
+# =======================
+$CASE_ID = "CASE_001"
+$ROOT = "$env:SystemDrive\DFIR_EDD_$CASE_ID"
+$COPY_DIR = "$ROOT\COPIED"
+$ERR_FILE = "$ROOT\ERRORS.txt"
+$OUT_FILE = "$ROOT\EDD.txt"
+
+New-Item -ItemType Directory -Force -Path $ROOT,$COPY_DIR | Out-Null
+
+$UTC = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+$HOST = $env:COMPUTERNAME
+
+# =======================
+# CIFRADOS CONOCIDOS
+# =======================
+$CRYPTO_SIGS = @(
+ "bitlocker","fvevol",
+ "veracrypt","truecrypt",
+ "pgpwded","pgp",
+ "safeboot","mcafee",
+ "checkpoint","fde",
+ "bestcrypt",
+ "symantec",
+ "luks"
+)
+
+# =======================
+# HELPERS
+# =======================
+function Log($msg){ Add-Content -Encoding UTF8 $OUT_FILE $msg }
+function LogErr($blk,$err){
+ Add-Content -Encoding UTF8 $ERR_FILE "[$blk] $err"
 }
 
-function Get-WindowsEdition {
-    try {
-        (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").EditionID
-    } catch { "UNKNOWN" }
+function SafeExec {
+ param($Name,[scriptblock]$Code)
+ try { & $Code }
+ catch {
+   LogErr $Name $_
+   try { & $Code }
+   catch { LogErr "$Name-RETRY" $_ }
+ }
 }
 
-function ManageBDE-Exists {
-    Test-Path "$env:SystemRoot\System32\manage-bde.exe"
+# =======================
+# HEADER (MAGNET STYLE)
+# =======================
+Log "MAGNET-STYLE ENCRYPTED DISK DETECTOR +"
+Log "Host: $HOST"
+Log "Case: $CASE_ID"
+Log "Time: $UTC"
+Log "-------------------------------------"
+
+# =======================
+# PHYSICAL DISKS
+# =======================
+SafeExec "DISKS" {
+ Log "== PHYSICAL DISKS =="
+ Get-Disk | ForEach-Object {
+   Log ("Disk {0}: {1} | Bus:{2} | Partition:{3}" -f `
+     $_.Number,$_.FriendlyName,$_.BusType,$_.PartitionStyle)
+ }
 }
 
-function Get-DriveBusType($drive) {
-    try {
-        $dl = $drive.TrimEnd(":")
-        (Get-Partition -DriveLetter $dl | Get-Disk).BusType
-    } catch { "UNKNOWN" }
+# =======================
+# LOGICAL VOLUMES
+# =======================
+SafeExec "VOLUMES" {
+ Log "== LOGICAL VOLUMES =="
+ Get-Volume | ForEach-Object {
+   Log ("Volume {0}: FS:{1} Label:{2} Health:{3}" -f `
+     $_.DriveLetter,$_.FileSystem,$_.FileSystemLabel,$_.HealthStatus)
+ }
 }
 
-function Drive-Accessible($drive) {
-    Test-Path "$drive\"
+# =======================
+# BITLOCKER
+# =======================
+SafeExec "BITLOCKER" {
+ Log "== BITLOCKER STATUS =="
+ Get-BitLockerVolume | ForEach-Object {
+   Log ("{0} | Encrypted:{1} | Lock:{2}" -f `
+     $_.MountPoint,$_.VolumeStatus,$_.LockStatus)
+ }
 }
 
-function Get-BitLockerStatus($drive) {
-    try { & manage-bde -status $drive 2>&1 } catch { $null }
+# =======================
+# ENCRYPTION DRIVERS
+# =======================
+SafeExec "DRIVERS" {
+ Log "== ENCRYPTION DRIVERS =="
+ Get-CimInstance Win32_SystemDriver | Where-Object {
+   $n=$_.Name.ToLower()
+   $CRYPTO_SIGS | Where-Object { $n -like "*$_*" }
+ } | ForEach-Object {
+   Log ("Driver {0} | State:{1} | Path:{2}" -f `
+     $_.Name,$_.State,$_.PathName)
+ }
 }
 
-function Copy-RawFile {
-    param($src)
-
-    $dstDir = "$env:USERPROFILE\Downloads\DFIR_Copy"
-    New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
-    $dst = Join-Path $dstDir ([IO.Path]::GetFileName($src))
-
-    Write-Host "[+] Copiando archivo RAW..."
-    $buf = New-Object byte[] 4MB
-    $in  = [IO.File]::OpenRead($src)
-    $out = [IO.File]::OpenWrite($dst)
-
-    while (($r = $in.Read($buf,0,$buf.Length)) -gt 0) {
-        $out.Write($buf,0,$r)
-    }
-
-    $in.Close(); $out.Close()
-    Write-Host "[+] Archivo copiado a $dst"
+# =======================
+# ENCRYPTION SERVICES
+# =======================
+SafeExec "SERVICES" {
+ Log "== ENCRYPTION SERVICES =="
+ Get-Service | Where-Object {
+   $n=$_.Name.ToLower()
+   $CRYPTO_SIGS | Where-Object { $n -like "*$_*" }
+ } | ForEach-Object {
+   Log ("Service {0} | Status:{1}" -f $_.Name,$_.Status)
+ }
 }
 
-# MAIN
-Write-Host "`n[+] BitLocker / USB Auto DFIR Tool`n"
-
-if (-not (Is-Admin)) {
-    Write-Host "[!] Ejecutar como Administrador."
-    exit 1
+# =======================
+# USB PRESENT & HISTORY
+# =======================
+SafeExec "USB_PRESENT" {
+ Log "== USB PRESENT =="
+ Get-PnpDevice -PresentOnly | Where-Object {
+   $_.Class -match "USB|Disk"
+ } | ForEach-Object {
+   Log ("USB {0} | Status:{1}" -f $_.FriendlyName,$_.Status)
+ }
 }
 
-$drive = Read-Host "Ingrese la partición (ej: E:)"
-if ($drive -notmatch "^[A-Z]:$" -or -not (Drive-Accessible $drive)) {
-    Write-Host "[!] Volumen inválido o no accesible."
-    exit 1
+SafeExec "USB_HISTORY" {
+ Log "== USB HISTORY =="
+ Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*" `
+  -ErrorAction Stop | ForEach-Object {
+   Log ("USB HIST {0}" -f $_.PSChildName)
+ }
 }
 
-$edition = Get-WindowsEdition
-$hasBDE  = ManageBDE-Exists
-$bus     = Get-DriveBusType $drive
+# =======================
+# DECISIÓN FORENSE
+# =======================
+SafeExec "DECISION" {
+ $enc = (Get-BitLockerVolume | Where-Object {
+   $_.VolumeStatus -ne "FullyDecrypted"
+ }).Count
 
-Write-Host "[i] Windows Edition : $edition"
-Write-Host "[i] manage-bde     : $hasBDE"
-Write-Host "[i] Bus Type       : $bus"
-
-# =========================
-# MODO WINDOWS HOME / SIN BITLOCKER
-# =========================
-if ($edition -match "Home" -or -not $hasBDE) {
-    Write-Host "`n[MODE] Windows Home / Sin BitLocker admin"
-    Write-Host "[+] Modo LECTURA forense"
-
-    Write-Host "[+] Listando archivos..."
-    Get-ChildItem "$drive\" -Recurse -Force -ErrorAction SilentlyContinue |
-        Where-Object { -not $_.PSIsContainer } |
-        Select-Object FullName, Length, LastWriteTime |
-        Format-Table -AutoSize
-
-    $src = Read-Host "`nRuta COMPLETA de archivo a copiar (Enter para salir)"
-    if ($src -and (Test-Path $src)) {
-        Copy-RawFile $src
-    }
-
-    Write-Host "`n[FIN]"
-    exit 0
+ Log "== FORENSIC DECISION =="
+ if($enc -gt 0){
+   Log "ENCRYPTION DETECTED – KEEP SYSTEM POWERED ON"
+ } else {
+   Log "NO FULL DISK ENCRYPTION DETECTED"
+ }
 }
 
-# MODO WINDOWS PRO / BITLOCKER
-$status = Get-BitLockerStatus $drive
-if (-not $status) {
-    Write-Host "[!] No se pudo obtener estado BitLocker."
-    exit 1
+# =======================
+# FILE COPY (SAFE)
+# =======================
+function Copy-AccessibleFile($Path){
+ SafeExec "COPY:$Path" {
+   if(Test-Path $Path){
+     $dst = Join-Path $COPY_DIR (Split-Path $Path -Leaf)
+     Copy-Item $Path $dst -Force
+     Log ("COPIED: $Path -> $dst")
+   }
+ }
 }
 
-if ($status -match "Bloqueado|Locked") {
-    Write-Host "[!] Unidad BLOQUEADA. Desbloquee primero."
-    exit 1
-}
+# Example:
+# Copy-AccessibleFile "C:\Users\Public\example.txt"
 
-if ($status -match "Sin cifrar|Fully Decrypted|Protección desactivada") {
-    Write-Host "[+] Unidad ya desencriptada."
-    Start-Process explorer.exe $drive
-    exit 0
-}
-
-Write-Host "`n[+] Iniciando desencriptado BitLocker..."
-$proc = Start-Process manage-bde.exe `
-        -ArgumentList "-off $drive" `
-        -Wait -PassThru -NoNewWindow
-
-if ($proc.ExitCode -ne 0) {
-    Write-Host "[!] Error en manage-bde (ExitCode $($proc.ExitCode))"
-    exit 1
-}
-
-Write-Host "[+] Desencriptado iniciado. Abriendo volumen..."
-Start-Process explorer.exe $drive
-
-Write-Host "`n[FIN]"
+Log "-------------------------------------"
+Log "EDD+ EXECUTION COMPLETE"
